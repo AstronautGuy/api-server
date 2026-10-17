@@ -1,7 +1,7 @@
 import { Router, Request, Response } from "express";
 import { dbPool } from "../db";
 import { formatDateToOdbc } from "../utils/dateUtils";
-import { formatCompanyCodeParam } from "../utils/companyCodeUtils";
+import { formatCompanyCodeParam, resolveCompanyCodeParam } from "../utils/companyCodeUtils";
 
 export const reportsRouter = Router();
 
@@ -24,7 +24,7 @@ reportsRouter.post("/stock-movement", async (req: Request, res: Response) => {
     const odbcFromDate = formatDateToOdbc(effectiveFrom);
     const odbcToDate = formatDateToOdbc(effectiveTo);
 
-    const compCodeParam = formatCompanyCodeParam(companyCode);
+    const compCodeParam = await resolveCompanyCodeParam(conn, companyCode);
     const compNo = req.body?.compNo ?? 11;
     const locParam = locNo ? `('${locNo}')` : "('11')";
 
@@ -45,7 +45,7 @@ reportsRouter.post("/stock-movement", async (req: Request, res: Response) => {
     const [rows] = await conn.query(sql);
     const reportData = ((rows as any)?.[0] || []);
 
-    res.json({ success: true, data: reportData });
+    res.json({ success: true, data: reportData, debugSql: sql });
   } catch (error: any) {
     console.error("[Reports API] Stock Movement Error:", error);
     res.status(500).json({ success: false, error: error.message || "Failed to generate stock report" });
@@ -74,7 +74,7 @@ reportsRouter.post("/customer-item-sale", async (req: Request, res: Response) =>
     const odbcFromDate = formatDateToOdbc(fromDateStr);
     const odbcToDate = formatDateToOdbc(toDateStr);
 
-    const compCodeParam = formatCompanyCodeParam(params.compCode);
+    const compCodeParam = await resolveCompanyCodeParam(conn, params.compCode);
     const custIdsParam = params.custIds || "";
     const itemIdsParam = params.itemIds || "";
     const salesmanIdsParam = params.salesmanIds || "";
@@ -114,7 +114,7 @@ reportsRouter.post("/customer-item-sale", async (req: Request, res: Response) =>
     const [callRes] = await conn.query(sql);
     const rows = Array.isArray(callRes) ? callRes[0] : callRes;
 
-    res.json({ success: true, data: rows || [] });
+    res.json({ success: true, data: rows || [], debugSql: sql });
   } catch (error: any) {
     console.error("[Reports API] Customer Item Sale Error:", error);
     res.status(500).json({ success: false, error: error.message || "Failed to execute rptItemCustomerSale" });
@@ -155,7 +155,7 @@ reportsRouter.post("/party-item-sale", async (req: Request, res: Response) => {
     const odbcFromDate = formatDateToOdbc(fromDateStr);
     const odbcToDate = formatDateToOdbc(toDateStr);
 
-    const compCodeParam = formatCompanyCodeParam(params.compCode);
+    const compCodeParam = await resolveCompanyCodeParam(conn, params.compCode);
     const custIdsParam = params.custIds || "";
     const divParam = params.div || "";
     const itemIdsParam = params.itemIds || "";
@@ -180,7 +180,7 @@ reportsRouter.post("/party-item-sale", async (req: Request, res: Response) => {
     const [callRes] = await conn.query(sql);
     const rows = Array.isArray(callRes) ? callRes[0] : callRes;
 
-    res.json({ success: true, data: rows || [] });
+    res.json({ success: true, data: rows || [], debugSql: sql });
   } catch (error: any) {
     console.error("[Reports API] Party Item Sale Error:", error);
     res.status(500).json({ success: false, error: error.message || "Failed to execute rptCompanyCustomerItemwiseSales" });
@@ -216,7 +216,7 @@ reportsRouter.post("/mr-overdue", async (req: Request, res: Response) => {
     const custTypeParam = params.custType || "All";
     const custIdsParam = params.custIds || "";
     const seriesIdsParam = params.seriesIds || "";
-    const compCodeParam = formatCompanyCodeParam(params.compCode);
+    const compCodeParam = await resolveCompanyCodeParam(conn, params.compCode);
     const custGrpParam = params.custGrp || "";
     const divIdsParam = params.divIds || "";
 
@@ -248,7 +248,7 @@ reportsRouter.post("/mr-overdue", async (req: Request, res: Response) => {
     const [resData] = await conn.query(sql);
     const rows = Array.isArray(resData) ? resData[0] : resData;
 
-    res.json({ success: true, data: rows || [] });
+    res.json({ success: true, data: rows || [], debugSql: sql });
   } catch (error: any) {
     console.error("[Reports API] Overdue Report Error:", error);
     res.status(500).json({ success: false, error: error.message || "Failed to load overdue report" });
@@ -265,7 +265,9 @@ reportsRouter.post("/claim-data", async (req: Request, res: Response) => {
   let conn;
   try {
     const params = req.body || {};
-    const uniqueCode = params.uniqueCode || "c9510231-4a58-4cb0-b40e-8fd18ff5f4ef";
+    const uniqueCode =
+      params.uniqueCode ||
+      `claim-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 
     conn = await dbPool.getConnection();
     await conn.query("SET sql_mode = ''");
@@ -278,12 +280,15 @@ reportsRouter.post("/claim-data", async (req: Request, res: Response) => {
       const compNo = params.compNo ?? 11;
       const locNo = Number(params.locNo) || 11;
       const finYear = params.finYear ?? 202627;
-      const compCodeParam = formatCompanyCodeParam(params.compCode);
+      const compCodeParam = await resolveCompanyCodeParam(conn, params.compCode);
+
+      // Clean existing rows for this uniqueCode before populating
+      await conn.query("DELETE FROM `pdyasvtrans`.`claimdata` WHERE `UniqueCode` = ?", [uniqueCode]);
 
       const prepSql =
         "CALL `pdyasvtrans`.`rptSaleFreeQtyStatement`(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
       const prepParams = [
-        "F",
+        params.isFC || "F",
         effectiveFrom,
         effectiveTo,
         compNo,
@@ -301,11 +306,22 @@ reportsRouter.post("/claim-data", async (req: Request, res: Response) => {
       await conn.query(prepSql, prepParams);
     }
 
-    const sql = `CALL \`pdyasvtrans\`.\`rptClaimData\`('${uniqueCode}')`;
-    const [callRes] = await conn.query(sql);
+    const sql = "CALL `pdyasvtrans`.`rptClaimData`(?)";
+    const [callRes] = await conn.query(sql, [uniqueCode]);
     const rows = Array.isArray(callRes) ? callRes[0] : callRes;
 
-    res.json({ success: true, data: rows || [] });
+    // Purge temporary claimdata rows after retrieval to keep database lean
+    try {
+      await conn.query("DELETE FROM `pdyasvtrans`.`claimdata` WHERE `UniqueCode` = ?", [uniqueCode]);
+    } catch (_) {
+      // non-blocking cleanup
+    }
+
+    res.json({
+      success: true,
+      data: rows || [],
+      debugSql: `CALL \`pdyasvtrans\`.\`rptClaimData\`('${uniqueCode}')`,
+    });
   } catch (error: any) {
     console.error("[Reports API] Claim Data Error:", error);
     res.status(500).json({ success: false, error: error.message || "Failed to load claim data" });
@@ -313,3 +329,145 @@ reportsRouter.post("/claim-data", async (req: Request, res: Response) => {
     if (conn) conn.release();
   }
 });
+
+/**
+ * 5. Developer Read-Only Procedure Sandbox & Benchmark
+ */
+reportsRouter.post("/dev-procedure-sandbox", async (req: Request, res: Response) => {
+  let conn;
+  let sql = "";
+  const start = Date.now();
+  try {
+    const { procedureName, params = {} } = req.body || {};
+    const allowedProcedures = [
+      "rptStockMovementStatement",
+      "rptItemCustomerSale",
+      "rptMRwisePeriodicalOutstanding",
+      "rptCompanyCustomerItemwiseSales",
+    ];
+
+    if (!allowedProcedures.includes(procedureName)) {
+      res.status(400).json({
+        success: false,
+        error: `Procedure not allowed. Allowed procedures: ${allowedProcedures.join(", ")}`,
+      });
+      return;
+    }
+
+    conn = await dbPool.getConnection();
+    await conn.query("SET sql_mode = ''");
+
+    sql = "";
+    const compCodeParam = await resolveCompanyCodeParam(conn, params.companyCode || "");
+    const odbcFrom = formatDateToOdbc(params.fromDate || "2026-04-01");
+    const odbcTo = formatDateToOdbc(params.toDate || new Date().toISOString().slice(0, 10));
+    const locParam = params.locNo ? `('${params.locNo}')` : "('11')";
+
+    if (procedureName === "rptStockMovementStatement") {
+      const formattedParams = [
+        params.compNo ?? 11,
+        `'${locParam.replace(/'/g, "''")}'`,
+        202627,
+        formatDateToOdbc("2026-04-01"),
+        odbcFrom,
+        odbcTo,
+        `'${compCodeParam.replace(/'/g, "''")}'`,
+        "''",
+        "''",
+        "'PRate'",
+      ].join(", ");
+      sql = `CALL \`pdyasvtrans\`.\`rptStockMovementStatement\`(${formattedParams})`;
+    } else if (procedureName === "rptItemCustomerSale") {
+      const formattedParams = [
+        odbcFrom,
+        odbcTo,
+        params.compNo ?? 11,
+        `'${locParam.replace(/'/g, "''")}'`,
+        202627,
+        "''",
+        "''",
+        "''",
+        `'${compCodeParam.replace(/'/g, "''")}'`,
+        "''",
+        "'Y'",
+        "''",
+        "''",
+        `'${locParam.replace(/'/g, "''")}'`,
+        "'SalesEntry'",
+        "''",
+      ].join(", ");
+      sql = `CALL \`pdyasvtrans\`.\`rptItemCustomerSale\`(${formattedParams})`;
+    } else if (procedureName === "rptMRwisePeriodicalOutstanding") {
+      const formattedParams = [
+        params.compNo ?? 11,
+        Number(params.locNo) || 11,
+        202627,
+        formatDateToOdbc("2026-04-01"),
+        odbcFrom,
+        odbcTo,
+        "''",
+        "''",
+        "'All'",
+        "''",
+        "''",
+        `'${compCodeParam.replace(/'/g, "''")}'`,
+        "''",
+        "''",
+        "''",
+      ].join(", ");
+      sql = `CALL \`rptMRwisePeriodicalOutstanding\`(${formattedParams})`;
+    } else if (procedureName === "rptCompanyCustomerItemwiseSales") {
+      const formattedParams = [
+        params.compNo ?? 11,
+        `'${locParam.replace(/'/g, "''")}'`,
+        202627,
+        odbcFrom,
+        odbcTo,
+        "''",
+        `'${compCodeParam.replace(/'/g, "''")}'`,
+        "''",
+        "''",
+        "'Y'",
+        "''",
+      ].join(", ");
+      sql = `CALL \`pdyasvtrans\`.\`rptCompanyCustomerItemwiseSales\`(${formattedParams})`;
+    }
+
+    const [rows, fields] = await conn.query(sql);
+    const durationMs = Date.now() - start;
+    const resultRows = Array.isArray(rows) && Array.isArray((rows as any)[0]) ? (rows as any)[0] : (rows as any) || [];
+    const columns = Array.isArray(resultRows) && resultRows.length > 0 ? Object.keys(resultRows[0]) : [];
+    const fullDebugSql = `SET sql_mode = '';\n${sql};`;
+
+    res.json({
+      success: true,
+      procedureName,
+      durationMs,
+      rowCount: resultRows.length,
+      columns,
+      sampleRows: resultRows.slice(0, 50),
+      debugSql: fullDebugSql,
+      data: {
+        procedureName,
+        durationMs,
+        rowCount: resultRows.length,
+        columns,
+        sampleRows: resultRows.slice(0, 50),
+        debugSql: fullDebugSql,
+      },
+    });
+  } catch (error: any) {
+    const durationMs = Date.now() - start;
+    console.error("[Reports API Sandbox Error]:", error);
+    const fullDebugSql = sql ? `SET sql_mode = '';\n${sql};` : "";
+    res.status(500).json({
+      success: false,
+      error: error.message || "Procedure execution failed",
+      durationMs,
+      debugSql: fullDebugSql,
+    });
+  } finally {
+    if (conn) conn.release();
+  }
+});
+

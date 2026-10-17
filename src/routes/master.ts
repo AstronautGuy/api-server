@@ -13,6 +13,7 @@ const SELECT_MKT_MR_COLUMNS = `
   mr.JobProfile AS JobProfile,
   mr.IsInActive AS IsInActive,
   mr.ShowDealerSalesinWeb AS ShowDealerSalesinWeb,
+  mr.\`Rank\` AS \`Rank\`,
   l.Division AS DivisionName,
   m.ID AS CompanyID,
   m.Code AS CompanyCode,
@@ -33,6 +34,31 @@ function normalizeLegacyMR(raw: any) {
   const division = raw.DivisionName ? String(raw.DivisionName).trim() : undefined;
   const company = raw.CompanyName || raw.CompanyCode ? String(raw.CompanyName || raw.CompanyCode).trim() : undefined;
   const companyCode = raw.CompanyCode ? String(raw.CompanyCode).trim() : undefined;
+
+  // Determine Rank: 1, 2, or 3
+  const rawRank = raw.Rank ?? raw.rank;
+  let rank: 1 | 2 | 3 = 3;
+  if (rawRank !== undefined && rawRank !== null) {
+    const parsed = Number(rawRank);
+    if (parsed === 1 || parsed === 2 || parsed === 3) {
+      rank = parsed;
+    }
+  } else if (raw.JobProfile) {
+    const jp = String(raw.JobProfile).toUpperCase().trim();
+    if (jp === "MR") rank = 1;
+    else if (jp === "ABM" || jp === "BO") rank = 2;
+    else rank = 3;
+  }
+
+  // Strict rank-based permissions:
+  // Rank 1: Stock only
+  // Rank 2: Stock and Claim Qty (Free Scheme)
+  // Rank 3: All reports
+  const canViewStock = true;
+  const canViewFreeScheme = rank >= 2;
+  const canViewSales = rank === 3;
+  const canViewPartyWise = rank === 3;
+  const canViewProductWise = rank === 3;
 
   return {
     ID: raw.ID,
@@ -55,11 +81,12 @@ function normalizeLegacyMR(raw: any) {
     company,
     companyCode,
     isBlocked,
-    canViewStock: true,
-    canViewSales: true,
-    canViewFreeScheme: true,
-    canViewPartyWise: true,
-    canViewProductWise: true,
+    rank,
+    canViewStock,
+    canViewSales,
+    canViewFreeScheme,
+    canViewPartyWise,
+    canViewProductWise,
   };
 }
 
@@ -131,15 +158,72 @@ masterRouter.get("/mr-info/:id", async (req: Request, res: Response) => {
 });
 
 /**
- * 2. All MR Users
+ * 2. MR Users (supports optional pagination: limit, offset, search, sort)
  */
-masterRouter.get("/mrs", async (_req: Request, res: Response) => {
+masterRouter.get("/mrs", async (req: Request, res: Response) => {
   try {
-    const [rows] = await dbPool.query(`${LEGACY_MKT_MR_QUERY} ORDER BY mr.MRName ASC`);
+    const rawLimit = req.query.limit ? parseInt(String(req.query.limit), 10) : undefined;
+    const rawOffset = req.query.offset ? parseInt(String(req.query.offset), 10) : 0;
+    const search = req.query.search ? String(req.query.search).trim() : "";
+    const sort = req.query.sort ? String(req.query.sort).trim() : "name_asc";
+
+    const FROM_JOIN_SQL = `
+      FROM \`pdyasvmaster\`.\`l_mktcompany_mr\` mr
+      LEFT JOIN \`pdyasvmaster\`.\`l_mktcompany\` l ON mr.DivisionID = l.ID
+      LEFT JOIN \`pdyasvmaster\`.\`m_mktcompany\` m ON l.CompCode = m.Code
+    `;
+
+    const whereClauses: string[] = [];
+    const whereParams: any[] = [];
+
+    if (search) {
+      whereClauses.push(
+        `(mr.MRName LIKE ? OR mr.EmailId LIKE ? OR mr.MobileNo LIKE ? OR l.Division LIKE ? OR m.Description LIKE ?)`
+      );
+      const pattern = `%${search}%`;
+      whereParams.push(pattern, pattern, pattern, pattern, pattern);
+    }
+
+    const whereSql = whereClauses.length > 0 ? `WHERE ${whereClauses.join(" AND ")}` : "";
+
+    let orderSql = `ORDER BY mr.MRName ASC`;
+    if (sort === "email_asc") {
+      orderSql = `ORDER BY mr.EmailId ASC`;
+    } else if (sort === "company_asc") {
+      orderSql = `ORDER BY m.Description ASC, mr.MRName ASC`;
+    }
+
+    // Unpaginated fallback if limit not provided
+    if (!rawLimit || isNaN(rawLimit) || rawLimit <= 0) {
+      const sql = `SELECT ${SELECT_MKT_MR_COLUMNS} ${FROM_JOIN_SQL} ${whereSql} ${orderSql}`;
+      const [rows] = await dbPool.query(sql, whereParams);
+      const results = ((rows as any[]) || []).map(normalizeLegacyMR);
+      res.json({ success: true, data: results });
+      return;
+    }
+
+    // Paginated flow
+    const limit = Math.min(rawLimit, 100);
+    const offset = Math.max(0, isNaN(rawOffset) ? 0 : rawOffset);
+
+    const countSql = `SELECT COUNT(*) AS total ${FROM_JOIN_SQL} ${whereSql}`;
+    const [countRows] = await dbPool.query(countSql, whereParams);
+    const total = Number((countRows as any[])?.[0]?.total || 0);
+
+    const dataSql = `SELECT ${SELECT_MKT_MR_COLUMNS} ${FROM_JOIN_SQL} ${whereSql} ${orderSql} LIMIT ? OFFSET ?`;
+    const [rows] = await dbPool.query(dataSql, [...whereParams, limit, offset]);
     const results = ((rows as any[]) || []).map(normalizeLegacyMR);
-    res.json({ success: true, data: results });
+
+    res.json({
+      success: true,
+      data: results,
+      total,
+      hasMore: offset + limit < total,
+      page: Math.floor(offset / limit) + 1,
+      limit,
+    });
   } catch (error: any) {
-    console.error("[Master API] All MRs Error:", error);
+    console.error("[Master API] MRs Query Error:", error);
     res.status(500).json({ success: false, error: error.message || "Failed to query MRs" });
   }
 });
